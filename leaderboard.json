@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-10-02T19:33:53Z",
+  "generated_at_utc": "2026-10-03T23:19:38Z",
   "as_of_market_date": "2026-10-02",
   "round_id": "trading-v0-round-2",
   "round_name": "Round 2",
@@ -175,9 +175,9 @@
     {
       "name": "QQQ",
       "label": "market context \u00b7 QQQ buy & hold",
-      "equity": 104899.23,
-      "pnl": 4899.23,
-      "ret": 0.049,
+      "equity": 104933.05,
+      "pnl": 4933.05,
+      "ret": 0.0493,
       "trades": 1,
       "days": 63,
       "since": "2026-07-07",
@@ -375,6 +375,17 @@
       "trades": 28,
       "days": 32,
       "since": "2026-08-19",
+      "as_of": "2026-10-02"
+    },
+    {
+      "name": "gugan",
+      "label": "round 2 \u00b7 entrant",
+      "equity": 101111.89,
+      "pnl": 1111.89,
+      "ret": 0.0111,
+      "trades": 5,
+      "days": 3,
+      "since": "2026-09-30",
       "as_of": "2026-10-02"
     },
     {

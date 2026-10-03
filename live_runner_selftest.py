@@ -62,6 +62,7 @@ def test_every_board_row_has_an_explicit_start() -> None:
     assert live_runner.ENTRY["meet"] == "2026-09-28"  # v7 revision loaded Sep 26
     assert live_runner.ENTRY["elamaran"] == "2026-07-13"
     assert live_runner.ENTRY["ddrives"] == "2026-08-17"
+    assert live_runner.ENTRY["gugan"] == "2026-09-30"
 
 
 def test_session_aware_agent_receives_exact_fill_session() -> None:
