@@ -1,3 +1,13 @@
+# Trade: Builderr Round 2 trading agent
+
+- `agent.py` is a single-file Python agent that uses only the standard library. Its entry point is `decide(market_state, portfolio_state, cash)`.
+- Strategy: trend-following rotation. When QQQ and SPY are in a confirmed uptrend, it holds the strongest trending names. In a calm uptrend it adds a small leveraged-ETF sleeve (TQQQ or SOXL). On a trend break or a fast crash signal it falls back to cash.
+- Risk caps are enforced inside `decide()`: about 21% per name and 1.33x beta-adjusted gross on buys. Leveraged names are trimmed first if gross drifts up.
+- To check it, run `python preview.py`. This is the template's local admission preview.
+- This is a paper-trading research entry. No performance is promised.
+
+---
+
 # builderr trading agent — starter template
 
 Submission template for the **builderr Trading Agent Leaderboard**.
