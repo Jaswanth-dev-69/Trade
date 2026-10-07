@@ -1,150 +1,153 @@
 """Strategy-level checks for agent.py.
 
 No network, no private engine, no third-party packages. These are not the
-official builderr evals; they catch contract, cap, and regime bugs before
-submission.
+official builderr evals; they exercise the real decide() contract (well-formed
+orders, caps, regime behaviour, determinism, bad-input safety) before submission.
 
 Run:
     python strategy_selftest.py
 """
 from __future__ import annotations
 
+import importlib.util
+import math
 import time
 from datetime import date, timedelta
+from pathlib import Path
 
-import agent
-
-
+AGENT_PATH = Path(__file__).with_name("agent.py")
+BETA = {"TQQQ": 3.0, "SOXL": 3.0, "UPRO": 3.0, "SPXL": 3.0, "QLD": 2.0, "SSO": 2.0}
 UNIVERSE = (
-    "SPY", "QQQ", "DIA", "IWM",
-    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "SMH",
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
-    "QLD", "SSO",
+    "SPY", "QQQ", "DIA", "IWM", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC",
+    "SMH", "SOXX", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AMD", "AVGO", "MU", "TSLA", "JPM",
+    "QLD", "SSO", "TQQQ", "SOXL",
 )
+SEMI_AI = {"NVDA", "AMD", "AVGO", "MU", "MRVL", "SMH", "SOXX", "PLTR"}
+
+
+def fresh_agent():
+    """A freshly loaded module per test, like the live runner (no state leaks between tests)."""
+    spec = importlib.util.spec_from_file_location(f"agent_under_test_{time.perf_counter_ns()}", AGENT_PATH)
+    assert spec is not None and spec.loader is not None, AGENT_PATH
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def bars(start: float, returns: list[float]) -> list[dict]:
-    out = []
-    px = start
-    d = date(2024, 1, 1)
+    out, px, d = [], start, date(2024, 1, 1)
     for r in returns:
         px *= 1.0 + r
-        out.append({
-            "ts": d.isoformat(),
-            "open": px,
-            "high": px * 1.01,
-            "low": px * 0.99,
-            "close": px,
-            "volume": 1_000_000,
-        })
+        out.append({"ts": d.isoformat(), "open": px, "high": px * 1.01, "low": px * 0.99, "close": px, "volume": 1_000_000})
         d += timedelta(days=1)
     return out
 
 
-def market(kind: str) -> dict[str, list[dict]]:
-    if kind == "risk_off":
-        base = [-0.003] * 90
-        defensive = [0.0005] * 90
-        return {t: bars(100.0, defensive if t in {"XLP", "XLU", "XLV", "XLE"} else base) for t in UNIVERSE}
-
-    if kind == "high_vol":
-        calm_up = [0.002] * 90
-        qqq_chop = ([0.035, -0.03] * 45)
-        data = {t: bars(100.0, calm_up) for t in UNIVERSE}
-        data["QQQ"] = bars(100.0, qqq_chop)
-        return data
-
-    # Low-vol risk-on, with differentiated momentum.
-    data = {t: bars(100.0, [0.001] * 90) for t in UNIVERSE}
-    for t in ("SMH", "NVDA", "XLK"):
-        data[t] = bars(100.0, [0.004] * 90)
-    for t in ("QQQ", "AAPL", "META"):
-        data[t] = bars(100.0, [0.0025] * 90)
-    data["SPY"] = bars(100.0, [0.0018] * 90)
-    data["QLD"] = bars(100.0, [0.0048] * 90)
-    data["SSO"] = bars(100.0, [0.0034] * 90)
+def market(kind: str, n: int = 150) -> dict[str, list[dict]]:
+    if kind == "crash":   # steady uptrend, then a sharp 5-day fall
+        path = [0.002] * (n - 5) + [-0.03] * 5
+        return {t: bars(100.0, [x * BETA.get(t, 1.0) for x in path]) for t in UNIVERSE}
+    data = {t: bars(100.0, [0.001] * n) for t in UNIVERSE}            # calm risk-on
+    for t in ("NVDA", "AMD", "AVGO", "MU", "SMH", "SOXX"):              # semis lead strongly
+        data[t] = bars(100.0, [0.004] * n)
+    for t in ("META", "AAPL"):
+        data[t] = bars(100.0, [0.003] * n)
+    data["QQQ"] = bars(100.0, [0.0025] * n)
+    data["SPY"] = bars(100.0, [0.0018] * n)
+    data["SOXL"] = bars(100.0, [0.012] * n)
+    data["TQQQ"] = bars(100.0, [0.0075] * n)
     return data
 
 
-def reset_agent_state() -> None:
-    agent._last_rebalance_bar_date = None
-    agent._last_targets = {}
+def portfolio(m, cash=100_000.0, positions=()):
+    return {"cash": cash, "positions": list(positions), "last_prices": {t: b[-1]["close"] for t, b in m.items()}}
 
 
-def beta_gross(weights: dict[str, float]) -> float:
-    return sum(w * agent.BETA_MULTIPLE.get(t, 1.0) for t, w in weights.items())
+def well_formed(orders, m) -> bool:
+    return isinstance(orders, list) and all(
+        isinstance(o, dict) and o.get("side") in ("buy", "sell") and o.get("ticker") in m
+        and isinstance(o.get("quantity"), (int, float)) and math.isfinite(o["quantity"]) and o["quantity"] > 0
+        for o in orders)
 
 
-def test_empty_data_returns_no_orders() -> None:
-    reset_agent_state()
-    assert agent.decide({}, {"cash": 100_000, "positions": [], "last_prices": {}}, 100_000) == []
-
-
-def test_insufficient_history_returns_no_targets() -> None:
-    short_market = {t: bars(100.0, [0.001] * 40) for t in UNIVERSE}
-    assert agent.target_weights(short_market) == {}
-
-
-def test_risk_off_uses_defensive_book() -> None:
-    weights = agent.target_weights(market("risk_off"))
-    assert set(weights).issubset({"XLP", "XLU", "XLV", "XLE"})
-    assert weights
-
-
-def test_risk_on_selects_positive_momentum() -> None:
-    weights = agent.target_weights(market("risk_on"))
-    assert {"SMH", "NVDA", "XLK"} & set(weights)
-    assert len(weights) >= 4
-
-
-def test_high_vol_disables_leverage() -> None:
-    weights = agent.target_weights(market("high_vol"))
-    assert "QLD" not in weights
-    assert "SSO" not in weights
-
-
-def test_caps_hold() -> None:
-    for kind in ("risk_off", "high_vol", "risk_on"):
-        weights = agent.target_weights(market(kind))
-        assert all(w < 0.240001 for w in weights.values()), (kind, weights)
-        assert beta_gross(weights) <= 1.350001, (kind, weights, beta_gross(weights))
-
-
-def test_orders_are_bounded_and_fast() -> None:
-    reset_agent_state()
+def test_bad_inputs_never_raise() -> None:
+    a = fresh_agent()
     m = market("risk_on")
-    latest = {t: b[-1]["close"] for t, b in m.items()}
-    portfolio = {"cash": 100_000.0, "positions": [], "last_prices": latest}
+    for args in (({}, {"cash": 1e5, "positions": []}, 1e5), (None, None, None),
+                 (m, {"cash": float("nan"), "positions": []}, float("nan")), (m, "garbage", 1e5)):
+        out = a.decide(*args)
+        assert isinstance(out, list), args
+        assert all(o["side"] == "sell" for o in out) or not out, out
+
+
+def test_short_history_trades_nothing() -> None:
+    a = fresh_agent()
+    m = market("risk_on", n=30)
+    assert a.decide(m, portfolio(m), 100_000.0) == []
+
+
+def test_risk_on_deploys_inside_caps() -> None:
+    a = fresh_agent()
+    m = market("risk_on")
+    orders = a.decide(m, portfolio(m), 100_000.0)
+    assert well_formed(orders, m) and 0 < len(orders) <= 6, orders
+    assert all(o["side"] == "buy" for o in orders), orders
+    px = {t: b[-1]["close"] for t, b in m.items()}
+    w = {o["ticker"]: o["quantity"] * px[o["ticker"]] / 100_000.0 for o in orders}
+    assert max(w.values()) <= 0.21 + 1e-9, w
+    assert sum(v * BETA.get(t, 1.0) for t, v in w.items()) <= 1.32 + 1e-9, w
+    assert sum(w.values()) <= 1.0, w
+    assert "SOXL" not in w and "TQQQ" in w, w                     # broad-index 3x sleeve only
+    assert sum(t in SEMI_AI for t in w) <= 2, w                    # semiconductor/AI cluster cap
+
+
+def test_crash_exits_to_cash() -> None:
+    a = fresh_agent()
+    m = market("crash")
+    px = {t: b[-1]["close"] for t, b in m.items()}
+    held = [{"ticker": t, "quantity": 190.0 / px[t] * 100, "avg_cost": px[t]} for t in ("NVDA", "META", "AAPL", "MSFT")]
+    orders = a.decide(m, portfolio(m, cash=24_000.0, positions=held), 24_000.0)
+    assert well_formed(orders, m), orders
+    assert orders and all(o["side"] == "sell" for o in orders), orders
+    assert {o["ticker"] for o in orders} == {"NVDA", "META", "AAPL", "MSFT"}, orders
+
+
+def test_identical_inputs_identical_orders() -> None:
+    a = fresh_agent()
+    m = market("risk_on")
+    first = a.decide(m, portfolio(m), 100_000.0)
+    for _ in range(12):
+        assert a.decide(m, portfolio(m), 100_000.0) == first
+
+
+def test_unreadable_position_blocks_buys() -> None:
+    a = fresh_agent()
+    m = market("risk_on")
+    orders = a.decide(m, portfolio(m, cash=80_000.0, positions=[{"ticker": "META", "avg_cost": 100.0}]), 80_000.0)
+    assert not any(o["side"] == "buy" for o in orders), orders
+
+
+def test_fast_with_large_universe() -> None:
+    a = fresh_agent()
+    m = market("risk_on", n=300)
+    big = dict(m)
+    for k in range(1000):
+        big[f"X{k:04d}"] = m["SPY"]
     start = time.perf_counter()
-    orders = agent.decide(m, portfolio, 100_000.0)
-    elapsed = time.perf_counter() - start
-    assert elapsed < 0.05, elapsed
-    assert 0 < len(orders) < 50, orders
-    assert all(o["side"] in {"buy", "sell"} and o["quantity"] > 0 for o in orders)
-    assert agent.decide(m, portfolio, 100_000.0) == []
-
-
-def test_tiny_stale_position_is_not_sold() -> None:
-    orders = agent.orders_to_rebalance(
-        targets={"SPY": 0.20},
-        positions={"XYZ": {"quantity": 0.5, "avg_cost": 100.0}},
-        total_equity=100_000.0,
-        prices={"XYZ": 100.0, "SPY": 500.0},
-        cash_available=0.0,
-    )
-    assert orders == []
+    orders = a.decide(big, portfolio(big), 100_000.0)
+    assert time.perf_counter() - start < 1.0
+    assert len(orders) <= 6, orders
 
 
 def run() -> None:
     tests = [
-        test_empty_data_returns_no_orders,
-        test_insufficient_history_returns_no_targets,
-        test_risk_off_uses_defensive_book,
-        test_risk_on_selects_positive_momentum,
-        test_high_vol_disables_leverage,
-        test_caps_hold,
-        test_orders_are_bounded_and_fast,
-        test_tiny_stale_position_is_not_sold,
+        test_bad_inputs_never_raise,
+        test_short_history_trades_nothing,
+        test_risk_on_deploys_inside_caps,
+        test_crash_exits_to_cash,
+        test_identical_inputs_identical_orders,
+        test_unreadable_position_blocks_buys,
+        test_fast_with_large_universe,
     ]
     for test in tests:
         test()

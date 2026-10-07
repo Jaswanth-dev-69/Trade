@@ -1,8 +1,10 @@
 """Convex Leader Momentum — builderr Trading Round 2 agent.
 
-One sentence: hold the strongest trending leaders (concentrated, equal-weight),
-add a small 3x Nasdaq/semis sleeve only in a calm confirmed uptrend, and step
-fully to cash on a trend break or a fast crash signal.
+One sentence: in a confirmed uptrend hold the four strongest trending leaders
+(at most two from the semiconductor/AI cluster), park the remaining cash in
+QQQ, add a small 3x Nasdaq (TQQQ) sleeve only in a calm uptrend, step to cash
+on a trend break or a fast crash signal, and re-enter as soon as QQQ is back
+above a rising 20-day average.
 
 Design rules
   * decide() depends only on its inputs: no clock, no randomness, no file or
@@ -10,17 +12,20 @@ Design rules
     memo of the orders already returned for identical inputs, keyed by the date
     of the latest QQQ bar. A repeated identical call returns identical orders
     and is not counted twice; past MAX_DAY_ORDERS only sells pass. With one call
-    per session (live scoring) none of this ever binds.
+    per session (live scoring) none of this binds. The orders themselves are a
+    pure function of the inputs: when a call trades anyway it also trims names
+    within 0.3 points of a trim line, so a re-call after the fills stays idle.
   * Garbage-in safety: unparseable bars are skipped, a held position that cannot
     be read blocks all buys, and a latest close that jumps implausibly (or
     disagrees with last_prices) freezes that ticker for the session.
   * Regime hysteresis is rebuilt from the price history on every call, and
     current holdings get a small rank buffer, so the bot does not churn.
   * Hard safety clamp: every order list is checked against a projected
-    post-trade book; per-name weight <= 21% and beta-adjusted gross <= 1.33x,
+    post-trade book; per-name weight <= 21% and beta-adjusted gross <= 1.32x,
     well inside the 30% / 1.5x rules, and names are trimmed back once they
     drift past 21% (so even a +36% one-day jump stays under 27%); levered
-    names are cut first whenever held gross drifts above 1.35x.
+    names are cut first whenever held gross drifts above 1.34x. At most 6
+    orders per call.
     Standard library only.
 """
 from __future__ import annotations
@@ -41,6 +46,9 @@ CFG = {
     "BRAKE_HOLD": 3,
     # V-recovery re-entry: strong 10-day QQQ thrust re-enables risk early
     "THRUST_R10": 0.08,
+    # fast re-entry after a trend-break exit: QQQ above a rising 20-day average
+    "REENTRY_SMA": 20,
+    "REENTRY_SLOPE": 5,      # "rising" = SMA20 above its value 5 sessions earlier
     # leader selection
     "MOM_LONG": 63,
     "MOM_SHORT": 21,
@@ -50,6 +58,7 @@ CFG = {
     "NAME_SMA": 50,
     "TOP_N": 4,
     "HOLD_BUFFER": 2,        # a held name stays while ranked <= TOP_N + buffer
+    "CLUSTER_MAX": 2,        # at most this many leaders from the semiconductor/AI cluster
     "NAME_W": 0.19,          # target weight per leader
     "STOCKS": 1,             # 1 = rank single stocks too, 0 = ETFs only
     "VOL_ADJ": 0,            # 1 = divide the momentum score by 20-day volatility
@@ -57,6 +66,7 @@ CFG = {
     "STRONG_VOL20": 0.28,    # QQQ 20-day annualised vol must be below this
     "SLEEVE_W": 0.15,        # dollar weight of the 3x sleeve (beta 0.45)
     "STRONG_NAME_W": 0.19,
+    "FILL_TO": 0.97,         # ON/STRONG: top up with QQQ (SPY if QQQ is a leader) to this invested fraction
     # trading hygiene
     "REBAL_BAND": 0.05,      # ignore weight changes smaller than this
     "SLEEVE_BAND": 0.03,     # tighter band for 2x/3x names (they drift 3x faster)
@@ -64,11 +74,11 @@ CFG = {
     "MIN_HISTORY": 64,
     # hard clamp (inside the official 0.30 / 1.50 limits)
     "CLAMP_NAME": 0.21,
-    "CLAMP_GROSS": 1.33,     # buys never take projected beta-gross above this
-    "GROSS_TRIM": 1.35,      # held beta-gross above this -> cut levered names first
+    "CLAMP_GROSS": 1.32,     # buys never take projected beta-gross above this
+    "GROSS_TRIM": 1.34,      # held beta-gross above this -> cut levered names first
     "BUY_PRICE_PAD": 0.01,   # size buys as if they fill 1% above last close
     "CASH_KEEP": 0.005,      # never spend the last 0.5% of equity
-    "MAX_ORDERS": 30,
+    "MAX_ORDERS": 6,         # per call (sells are listed first, so a cut only defers buys)
     "MAX_DAY_ORDERS": 40,    # per-session order budget (rule: <= 50 trades a day)
     "HARD_DAY_ORDERS": 48,   # past the budget only sells pass, up to this many
 }
@@ -82,7 +92,9 @@ ETF_LEADERS = (
     "SMH", "SOXX", "XLK", "XLC", "XLY", "XLF", "XLI", "XLE", "XLV", "XLP", "XLU",
     "XLRE", "IWM", "QQQ", "SPY", "DIA",
 )
-SLEEVE_QQQ, SLEEVE_SEMI = "TQQQ", "SOXL"
+SLEEVE = "TQQQ"            # broad-index 3x only: a sector 3x (SOXL) carries far more tail risk
+SEMI_AI = frozenset({"NVDA", "AMD", "AVGO", "MU", "MRVL", "SMH", "SOXX", "PLTR"})
+FILLS = ("QQQ", "SPY")       # where spare cash is parked, in order of preference
 BETA_3X = frozenset({"TQQQ", "SOXL", "UPRO", "SPXL", "TNA", "FAS", "TECL", "LABU",
                      "CURE", "DRN", "UDOW", "NAIL"})
 BETA_2X = frozenset({"QLD", "SSO", "DDM", "ROM", "UWM", "AGQ"})
@@ -93,6 +105,10 @@ def _beta(t: str) -> float:
 
 
 # ---------------------------------------------------------------- data helpers
+def _is_day(x: str) -> bool:
+    return len(x) >= 10 and x[4] == x[7] == "-" and (x[:4] + x[5:7] + x[8:10]).isdigit()
+
+
 def _daily_closes(bars) -> list[float]:
     """Close per calendar date, oldest first. Collapses intraday bars to daily.
 
@@ -103,7 +119,11 @@ def _daily_closes(bars) -> list[float]:
         keys = [str(b.get("ts", "")) for b in bars]
     except Exception:
         return []
-    if any(keys[k] > keys[k + 1] for k in range(len(keys) - 1)):
+    valid = [_is_day(k) for k in keys]
+    if any(valid) and not all(valid):   # drop bars whose timestamp is not a clean date
+        bars = [b for b, ok in zip(bars, valid) if ok]
+        keys = [k for k, ok in zip(keys, valid) if ok]
+    if all(_is_day(k) for k in keys) and any(keys[k] > keys[k + 1] for k in range(len(keys) - 1)):
         bars = [bars[k] for k in sorted(range(len(bars)), key=keys.__getitem__)]
     out: list[float] = []
     last_day = None
@@ -168,7 +188,7 @@ def _regime(q: list[float], s: list[float], c: dict) -> str:
     first = max(c["TREND_SMA"] + 11, n - c["REGIME_LOOKBACK"])
     if n < first + 1:
         return "OFF"
-    on = False
+    on = None        # first replayed bar: start from where QQQ/SPY sit vs their trend
     brake_left = 0
     for end in range(first, n + 1):
         sq, ss = _sma(q, c["TREND_SMA"], end), _sma(s, c["TREND_SMA"], end)
@@ -179,6 +199,10 @@ def _regime(q: list[float], s: list[float], c: dict) -> str:
             continue
         if brake_left > 0:
             brake_left -= 1
+        broken = qc < sq * (1 - c["BAND_OUT"]) or sc < ss * (1 - c["BAND_OUT"])
+        if on is None:
+            on = not broken and qc > sq and sc > ss
+            continue
         if on:
             if qc < sq * (1 - c["BAND_OUT"]) or sc < ss * (1 - c["BAND_OUT"]):
                 on = False
@@ -187,7 +211,10 @@ def _regime(q: list[float], s: list[float], c: dict) -> str:
             r10 = _ret(q, 10, end)
             sq20 = _sma(q, 20, end)
             thrust = r10 is not None and r10 > c["THRUST_R10"] and sq20 is not None and qc > sq20
-            if brake_left == 0 and (above or thrust):
+            a1 = _sma(q, c["REENTRY_SMA"], end)
+            a0 = _sma(q, c["REENTRY_SMA"], end - c["REENTRY_SLOPE"])
+            fast = a1 is not None and a0 is not None and qc > a1 and a1 > a0
+            if brake_left == 0 and not broken and (above or thrust or fast):
                 on = True
     if brake_left > 0 and not on:
         return "BRAKE"
@@ -248,31 +275,33 @@ def _targets(closes: dict, held: set, regime: str, c: dict) -> dict:
                      for sc in [_safe_score(closes[t], c)] if sc is not None),
                     key=lambda x: (-x[0], x[1]))
     names = [t for _, t in ranked]
-    keep = [t for t in names[: c["TOP_N"] + c["HOLD_BUFFER"]] if t in held]
-    picks = keep[: c["TOP_N"]]
-    for t in names:
+    keep = [t for t in names[: c["TOP_N"] + c["HOLD_BUFFER"]] if t in held and t not in FILLS]
+    picks: list = []
+    for t in keep + names:
         if len(picks) >= c["TOP_N"]:
             break
-        if t not in picks:
-            picks.append(t)
+        if t in picks:
+            continue
+        if t in SEMI_AI and sum(p in SEMI_AI for p in picks) >= c["CLUSTER_MAX"]:
+            continue
+        picks.append(t)
     w = c["STRONG_NAME_W"] if regime == "STRONG" else c["NAME_W"]
     tgt = {t: w for t in picks}
-    if regime == "STRONG" and c["SLEEVE_W"] > 0:
-        sleeve = SLEEVE_QQQ
-        smh, qqq = closes.get("SMH"), closes.get("QQQ")
-        s_smh = _safe_score(smh, c)
-        s_qqq = _safe_score(qqq, c)
-        if s_smh is not None and (s_qqq is None or s_smh > s_qqq) and SLEEVE_SEMI in closes:
-            sleeve = SLEEVE_SEMI
-        if sleeve in closes:
-            tgt[sleeve] = c["SLEEVE_W"]
-    return tgt
+    if regime == "STRONG" and c["SLEEVE_W"] > 0 and SLEEVE in closes:
+        tgt[SLEEVE] = c["SLEEVE_W"]
+    rest = c["FILL_TO"] - sum(tgt.values())
+    fill = next((f for f in FILLS if f not in tgt and f in closes), None)
+    if rest > 0.01 and fill:
+        tgt[fill] = min(rest, c["NAME_W"])   # never stacked on a pick, never at the trim line
+    return {t: min(w, c["CLAMP_NAME"]) for t, w in tgt.items()}
 
 
 # ---------------------------------------------------------------- orders
 def _orders(tgt: dict, qty: dict, px: dict, cash: float, c: dict, allow_buys: bool = True,
-            frozen: frozenset | set = frozenset()) -> list[dict]:
-    """Orders that move the book toward tgt. Tickers in `frozen` are never traded."""
+            frozen: frozenset | set = frozenset(), tight: bool = False) -> list[dict]:
+    """Orders that move the book toward tgt. Tickers in `frozen` are never bought.
+    tight=True lowers every sell-side trigger slightly (used when trading anyway)."""
+    ts_, tg_ = (0.003, 0.005) if tight else (0.0, 0.0)
     equity = cash + sum(q * px[t] for t, q in qty.items() if t in px)
     if equity <= 0:
         return []
@@ -280,13 +309,11 @@ def _orders(tgt: dict, qty: dict, px: dict, cash: float, c: dict, allow_buys: bo
     sells: dict[str, float] = {}
     buys: dict[str, float] = {}
     for t, w in cur.items():
-        if t in frozen:
-            continue
         goal = tgt.get(t, 0.0)
         if goal == 0.0:
             sells[t] = qty[t]
-        elif w > c["TRIM_AT"] or w - goal > (c["SLEEVE_BAND"] if _beta(t) > 1 else c["REBAL_BAND"]):
-            sells[t] = min(qty[t], (w - goal) * equity / px[t])
+        elif w > c["TRIM_AT"] - ts_ or w - goal > (c["SLEEVE_BAND"] if _beta(t) > 1 else c["REBAL_BAND"]) - ts_:
+            sells[t] = min(qty[t], (w - min(goal, c["TRIM_AT"])) * equity / px[t])
     for t, goal in tgt.items():
         if t not in px or not allow_buys or t in frozen:
             continue
@@ -295,13 +322,11 @@ def _orders(tgt: dict, qty: dict, px: dict, cash: float, c: dict, allow_buys: bo
             buys[t] = goal - w
     # leverage drift guard: if held beta gross is high, trim levered names first
     gross_now = sum(w * _beta(t) for t, w in cur.items())
-    if gross_now > c["GROSS_TRIM"]:
+    if gross_now > c["GROSS_TRIM"] - tg_:
         excess = gross_now - (c["GROSS_TRIM"] - 0.05)
         for t in sorted(cur, key=lambda x: (-_beta(x), x)):
             if excess <= 0 or _beta(t) == 1.0:
                 break
-            if t in frozen:
-                continue
             cut = min(cur[t] - (sells.get(t, 0.0) * px[t] / equity), excess / _beta(t))
             if cut > 0:
                 sells[t] = sells.get(t, 0.0) + cut * equity / px[t]
@@ -364,19 +389,20 @@ def _session_day(market_state):
         return None
     for want in ("QQQ", "SPY"):
         for t, v in market_state.items():
-            if str(t).upper() == want and isinstance(v, list) and v and isinstance(v[-1], dict):
-                d = str(v[-1].get("ts", ""))[:10]
-                if len(d) == 10 and d[4] == d[7] == "-" and (d[:4] + d[5:7] + d[8:]).isdigit():
-                    return d
+            if str(t).upper() == want and isinstance(v, list) and v:
+                days = [str(b.get("ts", ""))[:10] for b in v if isinstance(b, dict)]
+                days = [d for d in days if _is_day(d)]
+                if days:
+                    return max(days)
     return None
 
 
 def _fingerprint(market_state, portfolio_state, cash):
     """Hashable summary of everything decide() reads (None if it cannot be built)."""
     try:
-        mk = tuple(sorted((repr(t), len(v), repr(v[-1].get("ts")), repr(v[-1].get("close")))
-                          for t, v in market_state.items()
-                          if isinstance(v, list) and v and isinstance(v[-1], dict)))
+        mk = tuple(sorted((repr(t), len(v), repr(v[-1].get("ts")),
+                           hash(tuple((b.get("ts"), b.get("close")) if isinstance(b, dict) else repr(b) for b in v)))
+                          for t, v in market_state.items() if isinstance(v, list) and v))
         ps = portfolio_state if isinstance(portfolio_state, dict) else {}
         pos = ps.get("positions")
         pk = tuple(sorted(repr(sorted(p.items(), key=repr)) if isinstance(p, dict) else repr(p) for p in pos)) \
@@ -435,7 +461,7 @@ def _decide(market_state, portfolio_state, cash, c):
             continue
         if q > 0:
             qty[t] = qty.get(t, 0.0) + q
-            if t in suspect:
+            if t in suspect or t not in closes:   # bad tick or no live bar: equity uncertain
                 book_ok = False
             if t not in px:
                 try:
@@ -454,4 +480,7 @@ def _decide(market_state, portfolio_state, cash, c):
                        dict(c, REBAL_BAND=1.0, SLEEVE_BAND=1.0), allow_buys=False, frozen=suspect) if qty else []
     regime = _regime(q_, s_, c)
     tgt = _targets(closes, set(qty), regime, c)
-    return _orders(tgt, qty, px, cash_v, c, allow_buys=book_ok, frozen=suspect)
+    out = _orders(tgt, qty, px, cash_v, c, allow_buys=book_ok, frozen=suspect)
+    if out:   # trading anyway: also trim names sitting just under a trim line
+        out = _orders(tgt, qty, px, cash_v, c, allow_buys=book_ok, frozen=suspect, tight=True)
+    return out
