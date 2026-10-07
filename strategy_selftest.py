@@ -22,7 +22,6 @@ UNIVERSE = (
     "SMH", "SOXX", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AMD", "AVGO", "MU", "TSLA", "JPM",
     "QLD", "SSO", "TQQQ", "SOXL",
 )
-SEMI_AI = {"NVDA", "AMD", "AVGO", "MU", "MRVL", "SMH", "SOXX", "PLTR"}
 
 
 def fresh_agent():
@@ -47,6 +46,12 @@ def market(kind: str, n: int = 150) -> dict[str, list[dict]]:
     if kind == "crash":   # steady uptrend, then a sharp 5-day fall
         path = [0.002] * (n - 5) + [-0.03] * 5
         return {t: bars(100.0, [x * BETA.get(t, 1.0) for x in path]) for t in UNIVERSE}
+    if kind == "trend_break":   # indexes roll over slowly (no crash) while a few names keep trending
+        idx = [0.002] * (n - 25) + [-0.005] * 25
+        data = {t: bars(100.0, [x * BETA.get(t, 1.0) for x in idx]) for t in UNIVERSE}
+        for t in ("NVDA", "AMD", "AVGO", "MU"):
+            data[t] = bars(100.0, [0.004] * n)
+        return data
     data = {t: bars(100.0, [0.001] * n) for t in UNIVERSE}            # calm risk-on
     for t in ("NVDA", "AMD", "AVGO", "MU", "SMH", "SOXX"):              # semis lead strongly
         data[t] = bars(100.0, [0.004] * n)
@@ -56,6 +61,10 @@ def market(kind: str, n: int = 150) -> dict[str, list[dict]]:
     data["SPY"] = bars(100.0, [0.0018] * n)
     data["SOXL"] = bars(100.0, [0.012] * n)
     data["TQQQ"] = bars(100.0, [0.0075] * n)
+    if kind == "nasdaq_leads":   # QQQ trends harder than semiconductors
+        for t in ("NVDA", "AMD", "AVGO", "MU", "SMH", "SOXX"):
+            data[t] = bars(100.0, [0.0015] * n)
+        data["SOXL"] = bars(100.0, [0.0045] * n)
     return data
 
 
@@ -90,15 +99,35 @@ def test_risk_on_deploys_inside_caps() -> None:
     a = fresh_agent()
     m = market("risk_on")
     orders = a.decide(m, portfolio(m), 100_000.0)
-    assert well_formed(orders, m) and 0 < len(orders) <= 6, orders
+    assert well_formed(orders, m) and 0 < len(orders) <= 8, orders
     assert all(o["side"] == "buy" for o in orders), orders
     px = {t: b[-1]["close"] for t, b in m.items()}
     w = {o["ticker"]: o["quantity"] * px[o["ticker"]] / 100_000.0 for o in orders}
-    assert max(w.values()) <= 0.21 + 1e-9, w
-    assert sum(v * BETA.get(t, 1.0) for t, v in w.items()) <= 1.32 + 1e-9, w
+    assert a.CFG["CLAMP_NAME"] <= 0.25 and a.CFG["CLAMP_GROSS"] <= 1.40, a.CFG   # well inside 30% / 1.5x
+    assert max(w.values()) <= a.CFG["CLAMP_NAME"] + 1e-9, w
+    assert sum(v * BETA.get(t, 1.0) for t, v in w.items()) <= a.CFG["CLAMP_GROSS"] + 1e-9, w
     assert sum(w.values()) <= 1.0, w
-    assert "SOXL" not in w and "TQQQ" in w, w                     # broad-index 3x sleeve only
-    assert sum(t in SEMI_AI for t in w) <= 2, w                    # semiconductor/AI cluster cap
+    assert "SOXL" in w and "TQQQ" not in w, w                     # semiconductors trend harder here
+
+
+def test_sleeve_follows_the_stronger_index() -> None:
+    a = fresh_agent()
+    m = market("nasdaq_leads")
+    orders = a.decide(m, portfolio(m), 100_000.0)
+    bought = {o["ticker"] for o in orders if o["side"] == "buy"}
+    assert "TQQQ" in bought and "SOXL" not in bought, orders
+
+
+def test_trend_break_halves_the_leaders() -> None:
+    a = fresh_agent()
+    m = market("trend_break")
+    px = {t: b[-1]["close"] for t, b in m.items()}
+    held = {t: 19_000.0 / px[t] for t in ("NVDA", "AMD", "AVGO", "MU")}
+    orders = a.decide(m, portfolio(m, cash=24_000.0, positions=[
+        {"ticker": t, "quantity": q, "avg_cost": px[t]} for t, q in held.items()]), 24_000.0)
+    assert well_formed(orders, m) and orders and all(o["side"] == "sell" for o in orders), orders
+    for o in orders:   # about half of each leader is sold, not all of it
+        assert 0.35 <= o["quantity"] / held[o["ticker"]] <= 0.65, (o, held[o["ticker"]])
 
 
 def test_crash_exits_to_cash() -> None:
@@ -136,7 +165,7 @@ def test_fast_with_large_universe() -> None:
     start = time.perf_counter()
     orders = a.decide(big, portfolio(big), 100_000.0)
     assert time.perf_counter() - start < 1.0
-    assert len(orders) <= 6, orders
+    assert len(orders) <= 8, orders
 
 
 def run() -> None:
@@ -144,6 +173,8 @@ def run() -> None:
         test_bad_inputs_never_raise,
         test_short_history_trades_nothing,
         test_risk_on_deploys_inside_caps,
+        test_sleeve_follows_the_stronger_index,
+        test_trend_break_halves_the_leaders,
         test_crash_exits_to_cash,
         test_identical_inputs_identical_orders,
         test_unreadable_position_blocks_buys,

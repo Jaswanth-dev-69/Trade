@@ -1,10 +1,10 @@
 """Convex Leader Momentum — builderr Trading Round 2 agent.
 
-One sentence: in a confirmed uptrend hold the four strongest trending leaders
-(at most two from the semiconductor/AI cluster), park the remaining cash in
-QQQ, add a small 3x Nasdaq (TQQQ) sleeve only in a calm uptrend, step to cash
-on a trend break or a fast crash signal, and re-enter as soon as QQQ is back
-above a rising 20-day average.
+One sentence: in a confirmed uptrend hold the four strongest trending leaders,
+park the remaining cash in QQQ and, in a calm uptrend, add a 3x sleeve on
+whichever index is stronger (TQQQ for the Nasdaq-100, SOXL for semiconductors);
+on a trend break keep the leaders at half size, step fully to cash on a fast
+crash signal, and re-enter as soon as QQQ is back above a rising 20-day average.
 
 Design rules
   * decide() depends only on its inputs: no clock, no randomness, no file or
@@ -24,8 +24,8 @@ Design rules
     post-trade book; per-name weight <= 21% and beta-adjusted gross <= 1.32x,
     well inside the 30% / 1.5x rules, and names are trimmed back once they
     drift past 21% (so even a +36% one-day jump stays under 27%); levered
-    names are cut first whenever held gross drifts above 1.34x. At most 6
-    orders per call.
+    names are cut first whenever held gross drifts above 1.34x (so a 3x +55% /
+    1x +12% day stays near 1.45x). At most 8 orders per call.
     Standard library only.
 """
 from __future__ import annotations
@@ -36,8 +36,8 @@ import math
 CFG = {
     # regime (QQQ and SPY versus their 50-day averages, with hysteresis)
     "TREND_SMA": 50,
-    "BAND_IN": 0.010,        # need +1% above trend to switch risk on
-    "BAND_OUT": 0.010,       # switch off only on a -1% break below trend
+    "BAND_IN": 0.030,        # need +3% above trend to switch risk on
+    "BAND_OUT": 0.030,       # switch off only on a -3% break below trend
     "REGIME_LOOKBACK": 60,   # days replayed to rebuild the hysteresis state
     # fast crash brake (any one triggers; stays on for BRAKE_HOLD days)
     "BRAKE_R3": -0.05,       # QQQ 3-day return
@@ -58,15 +58,15 @@ CFG = {
     "NAME_SMA": 50,
     "TOP_N": 4,
     "HOLD_BUFFER": 2,        # a held name stays while ranked <= TOP_N + buffer
-    "CLUSTER_MAX": 2,        # at most this many leaders from the semiconductor/AI cluster
     "NAME_W": 0.19,          # target weight per leader
     "STOCKS": 1,             # 1 = rank single stocks too, 0 = ETFs only
     "VOL_ADJ": 0,            # 1 = divide the momentum score by 20-day volatility
     # strong state and the 3x sleeve
     "STRONG_VOL20": 0.28,    # QQQ 20-day annualised vol must be below this
-    "SLEEVE_W": 0.15,        # dollar weight of the 3x sleeve (beta 0.45)
+    "SLEEVE_W": 0.15,        # dollar weight of the 3x sleeve (beta-gross 0.45)
     "STRONG_NAME_W": 0.19,
     "FILL_TO": 0.97,         # ON/STRONG: top up with QQQ (SPY if QQQ is a leader) to this invested fraction
+    "OFF_W": 0.5,            # trend-break OFF (not a crash BRAKE): leaders held at this fraction of size
     # trading hygiene
     "REBAL_BAND": 0.05,      # ignore weight changes smaller than this
     "SLEEVE_BAND": 0.03,     # tighter band for 2x/3x names (they drift 3x faster)
@@ -78,7 +78,7 @@ CFG = {
     "GROSS_TRIM": 1.34,      # held beta-gross above this -> cut levered names first
     "BUY_PRICE_PAD": 0.01,   # size buys as if they fill 1% above last close
     "CASH_KEEP": 0.005,      # never spend the last 0.5% of equity
-    "MAX_ORDERS": 6,         # per call (sells are listed first, so a cut only defers buys)
+    "MAX_ORDERS": 8,         # per call (sells first, riskiest first, so a cut defers buys and small sells)
     "MAX_DAY_ORDERS": 40,    # per-session order budget (rule: <= 50 trades a day)
     "HARD_DAY_ORDERS": 48,   # past the budget only sells pass, up to this many
 }
@@ -92,8 +92,6 @@ ETF_LEADERS = (
     "SMH", "SOXX", "XLK", "XLC", "XLY", "XLF", "XLI", "XLE", "XLV", "XLP", "XLU",
     "XLRE", "IWM", "QQQ", "SPY", "DIA",
 )
-SLEEVE = "TQQQ"            # broad-index 3x only: a sector 3x (SOXL) carries far more tail risk
-SEMI_AI = frozenset({"NVDA", "AMD", "AVGO", "MU", "MRVL", "SMH", "SOXX", "PLTR"})
 FILLS = ("QQQ", "SPY")       # where spare cash is parked, in order of preference
 BETA_3X = frozenset({"TQQQ", "SOXL", "UPRO", "SPXL", "TNA", "FAS", "TECL", "LABU",
                      "CURE", "DRN", "UDOW", "NAIL"})
@@ -120,10 +118,11 @@ def _daily_closes(bars) -> list[float]:
     except Exception:
         return []
     valid = [_is_day(k) for k in keys]
-    if any(valid) and not all(valid):   # drop bars whose timestamp is not a clean date
+    clean = any(valid)
+    if clean and not all(valid):   # drop bars whose timestamp is not a clean date
         bars = [b for b, ok in zip(bars, valid) if ok]
         keys = [k for k, ok in zip(keys, valid) if ok]
-    if all(_is_day(k) for k in keys) and any(keys[k] > keys[k + 1] for k in range(len(keys) - 1)):
+    if clean and any(keys[k] > keys[k + 1] for k in range(len(keys) - 1)):
         bars = [bars[k] for k in sorted(range(len(bars)), key=keys.__getitem__)]
     out: list[float] = []
     last_day = None
@@ -268,7 +267,7 @@ def _sane(v: list[float], lp, levered: bool) -> bool:
 
 
 def _targets(closes: dict, held: set, regime: str, c: dict) -> dict:
-    if regime in ("OFF", "BRAKE"):
+    if regime == "BRAKE" or (regime == "OFF" and not c["OFF_W"]):
         return {}
     pool = (STOCK_LEADERS + ETF_LEADERS) if c["STOCKS"] else ETF_LEADERS
     ranked = sorted(((sc, t) for t in pool if t in closes
@@ -282,18 +281,27 @@ def _targets(closes: dict, held: set, regime: str, c: dict) -> dict:
             break
         if t in picks:
             continue
-        if t in SEMI_AI and sum(p in SEMI_AI for p in picks) >= c["CLUSTER_MAX"]:
-            continue
         picks.append(t)
     w = c["STRONG_NAME_W"] if regime == "STRONG" else c["NAME_W"]
+    if regime == "OFF":   # trend break: keep the leaders at reduced size, no sleeve, no fill
+        return {t: min(w * c["OFF_W"], c["CLAMP_NAME"]) for t in picks}
     tgt = {t: w for t in picks}
-    if regime == "STRONG" and c["SLEEVE_W"] > 0 and SLEEVE in closes:
-        tgt[SLEEVE] = c["SLEEVE_W"]
+    sleeve = _sleeve(closes, c)
+    if regime == "STRONG" and c["SLEEVE_W"] > 0 and sleeve:
+        tgt[sleeve] = c["SLEEVE_W"]
     rest = c["FILL_TO"] - sum(tgt.values())
     fill = next((f for f in FILLS if f not in tgt and f in closes), None)
     if rest > 0.01 and fill:
         tgt[fill] = min(rest, c["NAME_W"])   # never stacked on a pick, never at the trim line
     return {t: min(w, c["CLAMP_NAME"]) for t, w in tgt.items()}
+
+
+def _sleeve(closes: dict, c: dict):
+    """TQQQ, or SOXL when the semiconductor index (SMH) trends more strongly than QQQ."""
+    s_smh, s_qqq = _safe_score(closes.get("SMH"), c), _safe_score(closes.get("QQQ"), c)
+    if s_smh is not None and (s_qqq is None or s_smh > s_qqq) and "SOXL" in closes:
+        return "SOXL"
+    return "TQQQ" if "TQQQ" in closes else None
 
 
 # ---------------------------------------------------------------- orders
@@ -338,9 +346,11 @@ def _orders(tgt: dict, qty: dict, px: dict, cash: float, c: dict, allow_buys: bo
     proceeds = sum(sells[t] * px[t] for t in sells) * 0.995
     spend = max(0.0, cash + proceeds - c["CASH_KEEP"] * equity)
     gross_val = sum(v * _beta(t) for t, v in post_val.items())
-    # full exits sell the exact holding (no dust left behind); partial sells are floored
+    # full exits sell the exact holding (no dust left behind); partial sells are floored.
+    # Riskiest first (levered, then largest), so a cut at MAX_ORDERS only defers small sells and buys.
     out = [{"ticker": t, "side": "sell", "quantity": q if q >= qty[t] else _floor(q)}
-           for t, q in sorted(sells.items()) if (q if q >= qty[t] else _floor(q)) > 0]
+           for t, q in sorted(sells.items(), key=lambda kv: (-_beta(kv[0]), -cur.get(kv[0], 0.0), kv[0]))
+           if (q if q >= qty[t] else _floor(q)) > 0]
     for t in sorted(buys, key=lambda x: (-buys[x], x)):
         p = px[t] * (1 + c["BUY_PRICE_PAD"])
         room_name = c["CLAMP_NAME"] * equity - post_val.get(t, 0.0) * (1 + c["BUY_PRICE_PAD"])
@@ -357,7 +367,8 @@ def _orders(tgt: dict, qty: dict, px: dict, cash: float, c: dict, allow_buys: bo
 
 
 def _floor(x: float) -> float:
-    return math.floor(max(x, 0.0) * 1000.0) / 1000.0 if math.isfinite(x) else 0.0
+    y = max(x, 0.0) * 1000.0
+    return math.floor(y) / 1000.0 if math.isfinite(y) else 0.0
 
 
 # ---------------------------------------------------------------- entry point

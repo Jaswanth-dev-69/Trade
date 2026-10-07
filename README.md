@@ -1,8 +1,8 @@
 # Trade: Builderr Round 2 trading agent
 
 - `agent.py` is a single-file Python agent that uses only the standard library. Its entry point is `decide(market_state, portfolio_state, cash)`.
-- Strategy: trend-following rotation. When QQQ and SPY are in a confirmed uptrend, it holds the four strongest trending names (at most two from the semiconductor/AI group), parks spare cash in QQQ and, in a calm uptrend, adds a small TQQQ sleeve. On a trend break or a fast crash signal it falls back to cash, and it re-enters once QQQ is back above a rising 20-day average.
-- Risk caps are enforced inside `decide()`: about 21% per name and 1.32x beta-adjusted gross on buys. Leveraged names are trimmed first if gross drifts up. At most 6 orders per call.
+- Strategy: trend-following rotation. When QQQ and SPY are in a confirmed uptrend, it holds the four strongest trending names, parks spare cash in QQQ and, in a calm uptrend, adds a 3x sleeve on whichever index is trending harder (TQQQ for the Nasdaq-100, SOXL for semiconductors). On a trend break it keeps the leaders at half size; on a fast crash signal it goes to cash; it re-enters once QQQ is back above a rising 20-day average.
+- Risk caps are enforced inside `decide()`: about 21% per name and 1.32x beta-adjusted gross on buys. Leveraged names are trimmed first if gross drifts up. At most 8 orders per call.
 - To check it, run `python preview.py` (the template's local admission preview) and `python strategy_selftest.py`.
 - This is a paper-trading research entry. No performance is promised.
 
@@ -36,14 +36,14 @@ Fork this repo, implement `decide()` in `agent.py`, then send us the repo — **
 
 > **Secrets:** never commit API keys. You do not need an LLM, brokerage login, or real-money account to enter. If you use an LLM, use endpoint mode or a capped throwaway key.
 
-## Submitted agent: trend rotation with a TQQQ sleeve
+## Submitted agent: trend rotation with a 3x index sleeve
 
 `agent.py` is a no-network, no-LLM strategy that decides on the previous close and trades at the next open:
 
-- **Regime:** risk-on when QQQ and SPY are above their 50-day averages by a 1% buffer; a crash brake (QQQ −5% in 3 days, −7% in 5 days, or very high 10-day volatility) forces cash; re-entry once QQQ is above a rising 20-day average.
-- **Leaders:** the four strongest of the unlevered Round 2 tickers by 63/21-day momentum and distance above the 50-day average, at 19% each, with at most two from the semiconductor/AI group (NVDA, AMD, AVGO, MU, MRVL, SMH, SOXX, PLTR).
-- **Extras:** spare cash goes into QQQ (SPY if QQQ is already held) up to ~97% invested; a 15% TQQQ sleeve only in a calm uptrend.
-- **Caps:** names trimmed above 21%; buys keep beta-adjusted gross ≤ 1.32x; held gross above 1.34x cuts TQQQ first; at most 6 orders per call and 40 per session.
+- **Regime:** risk-on when QQQ and SPY are above their 50-day averages by a 3% buffer; a 3% break below either average halves the leaders and drops the sleeve; a crash brake (QQQ −5% in 3 days, −7% in 5 days, or very high 10-day volatility) forces cash; re-entry once QQQ is above a rising 20-day average.
+- **Leaders:** the four strongest of the unlevered Round 2 tickers by 63/21-day momentum and distance above the 50-day average, at 19% each.
+- **Extras:** spare cash goes into QQQ (SPY if QQQ is already held) up to ~97% invested; in a calm uptrend a 15% 3x sleeve: SOXL when the semiconductor ETF (SMH) has the stronger trend score, otherwise TQQQ.
+- **Caps:** names trimmed above 21%; buys keep beta-adjusted gross ≤ 1.32x; held gross above 1.34x cuts the 3x sleeve first; at most 8 orders per call and 40 per session.
 
 Run `python strategy_selftest.py` for contract and cap checks.
 
